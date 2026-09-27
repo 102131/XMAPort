@@ -2,8 +2,10 @@
 # -*- coding: utf-8 -*-
 # vbmeta 禁验补丁工具
 #
-# 读取 vbmeta 镜像，校验 AVB0 magic 后将偏移 123 处的 flags 字节
-# 设为 0x03（disable-verity | disable-verification），实现 AVB 校验禁用。
+# AVB flags 是位于 rollback_index 之后、release string 之前的 4 字节大端字段。
+# 已验证的 Android 实现通过下面 16 字节特征定位并替换，而不是写固定偏移：
+#   00000000 00000000 "avbtool " -> 00000002 00000000 "avbtool "
+# 其中 0x00000002 表示 AVB_VBMETA_IMAGE_FLAGS_VERIFICATION_DISABLED。
 #
 # 用法:
 #     python vbmeta_patch.py <文件或目录> [<文件或目录> ...]
@@ -16,8 +18,8 @@ import sys
 
 AVB_MAGIC = b"AVB0"
 AVB_MAGIC_LEN = 4
-FLAGS_OFFSET = 123
-FLAGS_DISABLE = b"\x03"
+UNPATCHED_PATTERN = bytes.fromhex("0000000000000000617662746F6F6C20")
+PATCHED_PATTERN = bytes.fromhex("0000000200000000617662746F6F6C20")
 
 
 def patch_one(path):
@@ -25,19 +27,22 @@ def patch_one(path):
     # 返回: (status, msg)  status: 'patched' | 'skipped' | 'invalid' | 'error'
     try:
         with open(path, "r+b") as f:
-            magic = f.read(AVB_MAGIC_LEN)
-            if magic != AVB_MAGIC:
+            data = f.read()
+            if len(data) < AVB_MAGIC_LEN or data[:AVB_MAGIC_LEN] != AVB_MAGIC:
                 return ("invalid", "not a vbmeta image (magic mismatch)")
-            f.seek(FLAGS_OFFSET)
-            cur = f.read(1)
-            if cur == FLAGS_DISABLE:
-                return ("skipped", "flags already 0x03 (idempotent)")
-            f.seek(FLAGS_OFFSET)
-            f.write(FLAGS_DISABLE)
+            has_unpatched = UNPATCHED_PATTERN in data
+            has_patched = PATCHED_PATTERN in data
+            if not has_unpatched:
+                if has_patched:
+                    return ("skipped", "flags already 0x00000002 (idempotent)")
+                return ("error", "expected flags/avbtool pattern not found")
+            data = data.replace(UNPATCHED_PATTERN, PATCHED_PATTERN)
+            f.seek(0)
+            f.write(data)
+            f.truncate()
             f.flush()
             os.fsync(f.fileno())
-            old = ord(cur) if cur else 0
-            return ("patched", "flags 0x%02X -> 0x03" % old)
+            return ("patched", "flags 0x00000000 -> 0x00000002")
     except OSError as e:
         return ("error", str(e))
 

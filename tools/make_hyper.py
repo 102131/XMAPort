@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import re
 import sys
 import shutil
 import subprocess
@@ -311,9 +312,9 @@ def sync_features(parent_dir):
                     target_name = trim_str(v)
                     break
 
-    if not target_name:
-        LOG_INFO("TARGET_DEVICE not set or empty in config.txt, no modification made, skipping.")
-        return 0
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", target_name):
+        LOG_ERROR("Unsafe TARGET_DEVICE rejected: " + target_name)
+        return 1
     LOG_INFO("TARGET_DEVICE: " + target_name)
 
     source_dir = os.path.join(parent_dir, "workspace", "source_filesystem", "product", "etc", "device_features")
@@ -886,9 +887,9 @@ def sync_fps_list(parent_dir):
                     target_name = trim_str(v)
                     break
 
-    if not target_name:
-        LOG_INFO("TARGET_DEVICE not set or empty in config.txt, no modification made, skipping.")
-        return 0
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", target_name):
+        LOG_ERROR("Unsafe TARGET_DEVICE rejected: " + target_name)
+        return 1
     LOG_INFO("TARGET_DEVICE: " + target_name)
 
     target_xml = os.path.join(parent_dir, "workspace", "target_filesystem", "product", "etc", "device_features", target_name + ".xml")

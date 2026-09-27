@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +29,7 @@ BD = "\x1b[1m"
 
 # ---------------- 控制常量 ----------------
 DEBUG_MODE = "1"
+TOOL_TIMEOUT = 10 * 60
 
 # auto 模式标志（--auto CLI），控制是否静默外部工具实时进度输出
 AUTO_MODE = False
@@ -147,6 +149,28 @@ def pause_seconds(seconds):
     time.sleep(seconds)
 
 
+DEVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def is_safe_device_name(name):
+    return bool(DEVICE_NAME_RE.fullmatch(name.strip()))
+
+
+def run_tool(cmd, **kwargs):
+    # 外部工具超过 10 分钟仍未退出时终止，避免流程永久挂起。
+    label = Path(cmd[0]).name if cmd else "external tool"
+    try:
+        return subprocess.run(cmd, timeout=TOOL_TIMEOUT, **kwargs)
+    except FileNotFoundError:
+        err("{} not found (tool missing or blocked by antivirus)".format(label))
+        log_write("ERROR: tool not found: {}".format(cmd[0]))
+        return subprocess.CompletedProcess(cmd, 127, stdout="", stderr="")
+    except subprocess.TimeoutExpired:
+        err("{} timed out after {} minutes".format(label, TOOL_TIMEOUT // 60))
+        log_write("ERROR: {} timed out after {} seconds".format(label, TOOL_TIMEOUT))
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+
+
 # ---------------- 全局状态 ----------------
 TARGET_DEVICE = ""
 SRC_URL = ""
@@ -156,6 +180,7 @@ THREADS = 16
 MAX_CONN = 16
 TIMEOUT = 300
 RETRY = 5
+RETRY_WAIT = 3
 
 # ---------------- CLI 覆盖参数（由 argparse 写入） ----------------
 CLI_SOURCE_URL = ""
@@ -220,6 +245,10 @@ def show_credits():
                        "https://github.com/ssut/payload-dumper-go", "MIT")
     show_credits_entry(4, "AOSP partition tools", "lpunpack, lpmake, lpdumps",
                        "https://github.com/nicktal01/aosp15_partition_tools", "Apache 2.0")
+    show_credits_entry(5, "erofs-utils", "EROFS image creation and extraction", "https://github.com/erofs/erofs-utils", "GPL v2")
+    show_credits_entry(6, "e2fsprogs", "ext4 tools: mke2fs, e2fsdroid", "https://github.com/tytso/e2fsprogs", "GPL v2 / LGPL v2")
+    show_credits_entry(7, "Google Brotli", "Block OTA Brotli decompression", "https://github.com/google/brotli", "MIT")
+    show_credits_entry(8, "Magisk", "Verified AVB verification-disable pattern", "https://github.com/topjohnwu/Magisk", "GPL v3")
     print("  " + D + "----------------------------------------------------------" + N)
     pause()
 
@@ -345,7 +374,6 @@ def read_packing_config():
         "format": "erofs",
         "compression": "lz4hc",
         "compression_level": "9",
-        "readonly": "true",
         "device_size": "6979321856",
         "metadata_size": "65536",
         "sparse": "true",
@@ -354,7 +382,6 @@ def read_packing_config():
         "super_group": "main",
         "metadata_slots": "3",
         "virtual_ab": "true",
-        "ext4_packer": "mke2fs",
         "is_skip_apex": "false",
         "enable_adb_debug": "false",
         "patch_vbmeta": "true",
@@ -422,9 +449,6 @@ pack_super=false
 ; Whether to generate sparse format image
 sparse=true
 
-; Whether partitions are read-only
-readonly=true
-
 ; Leave empty to auto use UTC timestamp, auto decide if needed
 utc_stamp=
 
@@ -461,12 +485,6 @@ compression_level=8
 
 ; Compatibility with old kernels (-E legacy-compress)
 erofs_old_kernel=false
-
-; ============================================
-; ext4 options (effective when format=ext4)
-; ============================================
-; ext4 packer: mke2fs (AOSP e2fsprogs + e2fsdroid)
-ext4_packer=mke2fs
 
 ; ============================================
 ; Keep this part as default
@@ -521,43 +539,143 @@ ro.vendor.video_box.version=2
     info("Created config template: {}".format(CONFIG))
 
 
-# ---------------- Step 1 下载 ----------------
-def dl_one(url, out_dir, name):
-    os.makedirs(out_dir, exist_ok=True)
-    info("Downloading: {}".format(name))
-    cmd = [
+# ---------------- Step 1 下载（两包并行 + 每包一行实时进度） ----------------
+# aria2 自带的 --max-tries 只重试瞬时网络错误（超时/断连），
+# HTTP 状态错误（403/404/5xx 等）会直接退出，因此必须在 Python 层整体重试。
+# 每次重试借助 --continue=true 从断点续传，不会从头下载。
+DL_SUMMARY_RE = re.compile(
+    r"\[#\w+ (\S+)/(\S+)\((\d+|--)%\)[^\]]*?DL:(\S+)")
+
+
+def _aria2_cmd(url, out_dir):
+    return [
         str(ARIA2), url,
         "-d", str(out_dir),
         "-x", str(MAX_CONN),
         "-s", str(THREADS),
         "-j", "1",
+        "--min-split-size=1M",
         "--console-log-level=notice",
         "--summary-interval=1",
         "--file-allocation=falloc",
         "--timeout={}".format(TIMEOUT),
-        "--max-tries={}".format(RETRY),
-        "--retry-wait=3",
+        "--max-tries={}".format(max(RETRY, 1)),
+        "--retry-wait={}".format(RETRY_WAIT),
+        "--lowest-speed-limit=10K",
         "--continue=true",
         "--auto-file-renaming=false",
         "--allow-overwrite=true",
         "--log-level=notice",
     ]
+
+
+def _download_worker(url, out_dir, name, state):
+    # 单包下载线程：整体重试，进度实时写入 state，不直接打印（避免打乱进度条）。
+    # retry=0 视为只下载一次（不重试），保证至少尝试 1 次。
+    total = max(RETRY, 1)
+    state["attempts"] = total
     try:
-        rc = subprocess.run(cmd).returncode
-    except Exception:
-        err("Download failed (aria2c not runnable): {}".format(name))
-        return 1
-    if rc != 0:
-        err("Download failed: {}".format(name))
-        return 1
-    info("{} download done".format(name))
+        os.makedirs(out_dir, exist_ok=True)
+        cmd = _aria2_cmd(url, out_dir)
+        for attempt in range(1, total + 1):
+            state["attempt"] = attempt
+            state["status"] = "connecting"
+            log_write("Download attempt {}/{} start: {}".format(attempt, total, name))
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, text=True,
+                                        errors="replace")
+            except Exception:
+                state["status"] = "failed"
+                state["rc"] = 1
+                state["error"] = "aria2c not runnable"
+                log_write("ERROR: aria2c not runnable for {}".format(name))
+                return
+            for line in proc.stdout:
+                m = DL_SUMMARY_RE.search(line)
+                if m:
+                    state["status"] = "downloading"
+                    (state["done"], state["total"],
+                     state["pct"], state["speed"]) = m.groups()
+            rc = proc.wait()
+            if rc == 0:
+                state["status"] = "done"
+                state["rc"] = 0
+                log_write("Download done: {}".format(name))
+                return
+            log_write("Download attempt {}/{} failed for {}: exit {}".format(
+                attempt, total, name, rc))
+            if attempt < total:
+                state["status"] = "retry_wait"
+                for left in range(RETRY_WAIT, 0, -1):
+                    state["retry_left"] = left
+                    time.sleep(1)
+        state["status"] = "failed"
+        state["rc"] = 1
+        state["error"] = "failed after {} attempts".format(total)
+        log_write("ERROR: download failed after {} attempts: {}".format(total, name))
+    except Exception as e:
+        # 线程内任何意外异常都落到 failed 帧，避免进度条定格假进度、rc 悬空
+        state["status"] = "failed"
+        state["rc"] = 1
+        state["error"] = "worker error: {}".format(e)
+        log_write("ERROR: download worker crashed for {}: {}".format(name, e))
+
+
+def _render_dl_line(name, st, bar_width=30):
+    s = st["status"]
+    if s == "done":
+        total = st.get("total", "")
+        return "  {:<10} [{}] 100%  {}  done".format(name, "#" * bar_width, total)
+    if s == "failed":
+        return "  {:<10} [FAILED] {}".format(name, st.get("error", ""))
+    if s == "retry_wait":
+        return "  {:<10} attempt {}/{} failed, retrying in {}s ...".format(
+            name, st.get("attempt", 1), st.get("attempts", RETRY),
+            st.get("retry_left", RETRY_WAIT))
+    if s in ("starting", "connecting"):
+        return "  {:<10} connecting ...".format(name)
+    done = st.get("done", "?")
+    total = st.get("total", "?")
+    speed = st.get("speed", "?")
     try:
-        for f in sorted(out_dir.iterdir()):
-            if f.is_file():
-                info("  {}  {} bytes".format(f.name, f.stat().st_size))
-    except Exception:
-        pass
-    return 0
+        p = int(st.get("pct", "0"))
+    except ValueError:
+        p = 0
+    filled = int(bar_width * p / 100)
+    bar = "#" * filled + "-" * (bar_width - filled)
+    return "  {:<10} [{}] {:>3}%  {} / {}  DL:{}".format(
+        name, bar, p, done, total, speed)
+
+
+def download_roms(jobs):
+    # 并行下载多个 ROM。jobs: [(url, out_dir, name), ...]；返回 {name: rc}。
+    # 交互终端下每秒重绘进度（每包一行）；非 TTY（CI 日志）静默等待。
+    states = {name: {"status": "starting", "rc": None} for _, _, name in jobs}
+    threads = []
+    for url, out_dir, name in jobs:
+        t = threading.Thread(target=_download_worker,
+                             args=(url, out_dir, name, states[name]), daemon=True)
+        t.start()
+        threads.append(t)
+
+    if sys.stdout.isatty():
+        printed = False
+        while True:
+            if printed:
+                sys.stdout.write("\x1b[{}A".format(len(jobs)))
+            for _, _, name in jobs:
+                sys.stdout.write("\x1b[2K" + _render_dl_line(name, states[name]) + "\n")
+            sys.stdout.flush()
+            printed = True
+            if all(not t.is_alive() for t in threads):
+                break
+            time.sleep(1)
+    else:
+        for t in threads:
+            t.join()
+
+    return {name: states[name]["rc"] for _, _, name in jobs}
 
 
 # ---------------- Step 2 解包 ----------------
@@ -565,30 +683,48 @@ def extract_archive(src_dir, out_dir, label):
     src_dir = Path(src_dir)
     os.makedirs(out_dir, exist_ok=True)
     count = 0
+    fail = 0
     for ext in ["*.zip", "*.tar", "*.gz", "*.tgz", "*.7z", "*.rar"]:
         for f in sorted(src_dir.glob(ext)):
             count += 1
             info("Processing: {}".format(f.name))
-            rc = subprocess.run([str(SZ), "x", str(f), "-o" + str(out_dir), "-y"],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+            rc = run_tool([str(SZ), "x", str(f), "-o" + str(out_dir), "-y"],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
             if rc == 0:
                 info("Extracted: {}".format(f.name))
             else:
                 err("Extract failed: {}".format(f.name))
+                log_write("ERROR: extract failed: {} (rc={})".format(f.name, rc))
+                fail += 1
     if count == 0:
         err("No archives found in {}".format(src_dir))
+        log_write("ERROR: no archives found in {}".format(src_dir))
+        return 1
+    if fail:
+        err("{}/{} archive(s) failed to extract".format(fail, count))
+        log_write("ERROR: {}/{} archive(s) failed to extract".format(fail, count))
         return 1
     return 0
 
 
 # ---------------- Step 3 payload 解包 ----------------
+REQUIRED_PAYLOAD_IMAGES = {
+    "system.img",
+    "system_ext.img",
+    "product.img",
+    "vendor.img",
+    "odm.img",
+}
+
+
 def check_payload_extracted(target_dir):
     target_dir = Path(target_dir)
     if not target_dir.exists():
         return False
-    count = sum(1 for _ in target_dir.rglob("*") if _.is_file())
-    if count > 6:
-        info("Already extracted ({} files), skipping.".format(count))
+    found = {p.name.lower() for p in target_dir.rglob("*.img") if p.is_file()}
+    if len(found) >= 6 and REQUIRED_PAYLOAD_IMAGES.issubset(found):
+        info("Already extracted ({} partition images, required partitions present), skipping.".format(
+            len(found)))
         return True
     return False
 
@@ -618,12 +754,12 @@ def extract_payload_bin(rom_dir, out_dir):
         info("Found payload.bin (A/B OTA), extracting...")
         cmd = [str(PDUMP), "-o", str(out_dir), str(payload_file)]
         if AUTO_MODE:
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE,
-                                  stderr=subprocess.STDOUT, text=True,
-                                  errors="replace")
+            proc = run_tool(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True,
+                            errors="replace")
             rc = proc.returncode
         else:
-            rc = subprocess.run(cmd).returncode
+            rc = run_tool(cmd).returncode
         if rc != 0:
             err("payload-dumper-go failed")
             if AUTO_MODE and proc.stdout:
@@ -640,8 +776,8 @@ def extract_payload_bin(rom_dir, out_dir):
     if fmt == "block_dat":
         # block OTA（.dat / .dat.br / .dat.xz / 分卷）→ 转换为 .img
         info("Found block OTA (.dat/.dat.br), converting to .img...")
-        rc = subprocess.run([PY, str(TOOLS / "extract_dat.py"),
-                              str(rom_dir), str(out_dir)]).returncode
+        rc = run_tool([PY, str(TOOLS / "extract_dat.py"),
+                       str(rom_dir), str(out_dir)]).returncode
         if rc != 0:
             err("block OTA .dat conversion failed")
             log_write("ERROR: extract_dat.py failed")
@@ -652,14 +788,21 @@ def extract_payload_bin(rom_dir, out_dir):
     # fmt == "img"：没有 payload.bin 和 .dat，直接复制已有的 .img
     info("No payload.bin / .dat found, copying existing .img files...")
     count = 0
+    fail = 0
     for f in rom_dir.rglob("*.img"):
         count += 1
         try:
             shutil.copy2(f, out_dir / f.name)
-        except Exception:
-            pass
+        except Exception as e:
+            err("Failed to copy {}: {}".format(f.name, e))
+            log_write("ERROR: copy {} failed: {}".format(f.name, e))
+            fail += 1
     info("Copied {} img file(s)".format(count))
-    return 0
+    if count == 0:
+        err("No .img files found in {}".format(rom_dir))
+        log_write("ERROR: no .img files found in {}".format(rom_dir))
+        return 1
+    return 1 if fail else 0
 
 
 # ---------------- Step 4 镜像解包 ----------------
@@ -667,16 +810,22 @@ def unpack_all_img(img_dir, out_dir, label):
     img_dir = Path(img_dir)
     out_dir = Path(out_dir)
     os.makedirs(out_dir, exist_ok=True)
+    fail = 0
     for part in UNPACK_PARTS:
         img = img_dir / (part + ".img")
         if img.exists():
             info("Processing {}.img ...".format(part))
             os.makedirs(out_dir / part, exist_ok=True)
-            rc = subprocess.run([PY, str(TOOLS / "extract_img.py"), str(img), str(out_dir / part)]).returncode
+            rc = run_tool([PY, str(TOOLS / "extract_img.py"), str(img), str(out_dir / part)]).returncode
             if rc != 0:
                 err("Failed to extract {}.img".format(part))
+                log_write("ERROR: extract {}.img failed (rc={})".format(part, rc))
+                fail += 1
             else:
                 info("{}.img extracted".format(part))
+    if fail:
+        err("{}/{} image(s) failed to unpack".format(fail, len(UNPACK_PARTS)))
+        return 1
     return 0
 
 
@@ -747,9 +896,9 @@ def patch_vbmeta(pack_cfg):
 
 
 def _append_lpc_entry(lpc_args, part, img_path, size, pack_cfg):
-    attrs = "readonly" if pack_cfg.get("readonly", "true").lower() == "true" else "none"
-    lpc_args.append("--partition={}:{}:{}:{}".format(
-        part, attrs, size, pack_cfg.get("super_group", "main")))
+    # 与 R3 版(20260811)完全一致：readonly 写死
+    lpc_args.append("--partition={}:readonly:{}:{}".format(
+        part, size, pack_cfg.get("super_group", "main")))
     lpc_args.append("--image={}={}".format(part, img_path))
 
 
@@ -766,9 +915,8 @@ def pack_one_partition(part, fs_dir, pack_cfg, lpc_args, counters):
         "{},{}".format(pack_cfg["compression"], pack_cfg["compression_level"]),
         str(src),
         str(PACK_OUT),
-        pack_cfg["ext4_packer"],
     ]
-    rc = subprocess.run(cmd).returncode
+    rc = run_tool(cmd).returncode
     out_img = PACK_OUT / (part + ".img")
     if rc != 0:
         err("{}: pack_partitions.py failed".format(part))
@@ -791,16 +939,22 @@ def copy_partition_image(part, src_file, pack_cfg, lpc_args, counters):
     # 从 payload 镜像直接复制到 packed（mi_ext / vendor / vendor_dlkm）
     if not src_file.exists():
         err("{}.img not found in payload".format(part))
+        log_write("ERROR: {}.img not found in payload".format(part))
+        counters["pack_fail"] += 1
         pause()
         return
     try:
         shutil.copy2(src_file, PACK_OUT / src_file.name)
-    except Exception:
-        err("{}.img copy failed".format(part))
+    except Exception as e:
+        err("{}.img copy failed: {}".format(part, e))
+        log_write("ERROR: {}.img copy failed: {}".format(part, e))
+        counters["pack_fail"] += 1
         pause()
         return
     if not (PACK_OUT / src_file.name).exists():
         err("{}.img copy failed".format(part))
+        log_write("ERROR: {}.img copy failed (output missing)".format(part))
+        counters["pack_fail"] += 1
         pause()
         return
     size = (PACK_OUT / src_file.name).stat().st_size
@@ -834,12 +988,39 @@ def create_super_img(pack_cfg, lpc_args, pack_ok):
         cmd.append("--sparse")
     cmd += ["--output=" + str(PACK_OUT / "super.img")]
     info("lpmake command: " + subprocess.list2cmdline(cmd))
-    proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    # lpmake 日志实时滚屏（不吞日志），同时逐行留档用于失败分类；
+    # 10 分钟看门狗防止 lpmake 卡死。
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True,
+                            errors="replace")
+    timed_out = False
+
+    def _kill_lpmake():
+        nonlocal timed_out
+        timed_out = True
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    watchdog = threading.Timer(TOOL_TIMEOUT, _kill_lpmake)
+    watchdog.start()
+    output_lines = []
+    try:
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            output_lines.append(line)
+        proc.wait()
+    finally:
+        watchdog.cancel()
     rc = proc.returncode
+    output = "".join(output_lines)
+    if timed_out:
+        err("lpmake timed out after {} minutes".format(TOOL_TIMEOUT // 60))
+        log_write("ERROR: lpmake timed out after {} seconds".format(TOOL_TIMEOUT))
+        return 2
     if rc != 0:
-        output = (proc.stdout or "") + (proc.stderr or "")
-        if output.strip():
-            print(output.strip(), flush=True)
         lower = output.lower()
         if any(kw in lower for kw in ["exceeds", "not enough", "no space", "too large", "overflow", "size limit"]):
             m = re.search(r"partition\s+(\S+)\s+with\s+size\s+(\d+)", lower)
@@ -852,8 +1033,8 @@ def create_super_img(pack_cfg, lpc_args, pack_ok):
                 err("lpmake failed: super space insufficient")
                 log_write("ERROR: lpmake failed - super space insufficient")
             return 1
-        err("lpmake failed")
-        log_write("ERROR: lpmake failed to create super.img")
+        err("lpmake failed (full log above)")
+        log_write("ERROR: lpmake failed to create super.img (rc={})".format(rc))
         pause()
         return 2
     log_write("super.img created successfully")
@@ -863,6 +1044,16 @@ def create_super_img(pack_cfg, lpc_args, pack_ok):
     if sup.exists():
         info("super.img created, {} bytes".format(sup.stat().st_size))
     return 0
+
+
+def _abort_port(auto, msg):
+    # 流水线中途失败的统一出口：auto 直接返回失败码；交互提示后回菜单
+    err(msg)
+    log_write("ERROR: {}".format(msg))
+    if auto:
+        return 1
+    pause()
+    raise ReturnToMenu()
 
 
 # ---------------- 一键移植流水线 ----------------
@@ -907,8 +1098,7 @@ def one_click_port(auto=False):
     # 输入/读取目标设备代号
     cfg_txt = WORKSPACE / "config.txt"
     if CLI_DEVICE:
-        TARGET_DEVICE = CLI_DEVICE
-        cfg_txt.write_text("TARGET_DEVICE={}\n".format(TARGET_DEVICE), encoding="gbk")
+        TARGET_DEVICE = CLI_DEVICE.strip()
         info("Device codename from --device: {}".format(TARGET_DEVICE))
     elif cfg_txt.exists():
         for line in cfg_txt.read_text(encoding="gbk", errors="ignore").splitlines():
@@ -922,8 +1112,16 @@ def one_click_port(auto=False):
     else:
         print("  {}  Enter target device codename:{}".format(W, N))
         print("  {}  (e.g. sheng, fuxi, cupid, mondrian){}".format(D, N))
-        TARGET_DEVICE = prompt("  > ")
-        cfg_txt.write_text("TARGET_DEVICE={}\n".format(TARGET_DEVICE), encoding="gbk")
+        TARGET_DEVICE = prompt("  > ").strip()
+
+    if not is_safe_device_name(TARGET_DEVICE):
+        err("Invalid device codename: only A-Z, a-z, 0-9, underscore and hyphen are allowed")
+        log_write("ERROR: unsafe device codename rejected: {}".format(TARGET_DEVICE))
+        if auto:
+            return 1
+        pause()
+        raise ReturnToMenu()
+    cfg_txt.write_text("TARGET_DEVICE={}\n".format(TARGET_DEVICE), encoding="gbk")
 
     print("  {}  Source URL:   {}{}{}".format(W, C, SRC_URL[:50], N))
     print("  {}  Target URL:   {}{}{}".format(W, C, TGT_URL[:50], N))
@@ -939,39 +1137,55 @@ def one_click_port(auto=False):
     else:
         info("Auto mode: skipping confirmation, proceeding...")
 
-    # ---------------- Step 1: 下载 ----------------
+    # ---------------- Step 1: 下载（两包并行） ----------------
     info("=== Step 1/7: Download ROM ===")
     log_write("Step 1: Download ROM start")
     log_write("Source URL: {}".format(SRC_URL))
     log_write("Target URL: {}".format(TGT_URL))
+    jobs = []
     if SRC_URL:
-        info("[1/2] Downloading source ROM...")
-        if dl_one(SRC_URL, SRC_DL, "SourceROM") != 0:
-            err("Step 1 failed: source ROM download")
-            log_write("ERROR: Source ROM download failed")
-            if auto:
-                return 1
-            pause()
-            raise ReturnToMenu()
+        jobs.append((SRC_URL, SRC_DL, "SourceROM"))
     if TGT_URL:
-        info("[2/2] Downloading target ROM...")
-        if dl_one(TGT_URL, TGT_DL, "TargetROM") != 0:
-            err("Step 1 failed: target ROM download")
-            log_write("ERROR: Target ROM download failed")
+        jobs.append((TGT_URL, TGT_DL, "TargetROM"))
+    if jobs:
+        results = download_roms(jobs)
+        failed = [name for name, rc in results.items() if rc != 0]
+        if failed:
+            err("Step 1 failed: {} download".format(" / ".join(failed)))
+            log_write("ERROR: Step 1 download failed: {}".format(", ".join(failed)))
             if auto:
                 return 1
             pause()
             raise ReturnToMenu()
+        for d in [SRC_DL, TGT_DL]:
+            try:
+                for f in sorted(d.iterdir()):
+                    if f.is_file():
+                        info("  {}  {} bytes".format(f.name, f.stat().st_size))
+            except Exception:
+                pass
     info("Step 1 done")
     log_write("Step 1: Download ROM done")
 
     # ---------------- Step 2: 解压 ----------------
+    # URL 留空 = 复用上次工作区（设计如此）：无归档可解压时跳过而非报错；
+    # URL 有值时下载必然产生了新归档，解压失败才算真失败。
     info("=== Step 2/7: Extract archives ===")
     log_write("Step 2: Extract archives start")
-    info("[1/2] Extracting source archive...")
-    extract_archive(SRC_DL, SRC_ROM, "Source")
-    info("[2/2] Extracting target archive...")
-    extract_archive(TGT_DL, TGT_ROM, "Target")
+    if SRC_URL:
+        info("[1/2] Extracting source archive...")
+        if extract_archive(SRC_DL, SRC_ROM, "Source") != 0:
+            return _abort_port(auto, "Step 2 failed: source archive extraction")
+    else:
+        info("[1/2] SRC_URL empty, reusing existing source workspace")
+        log_write("Step 2: SRC_URL empty, reuse source workspace")
+    if TGT_URL:
+        info("[2/2] Extracting target archive...")
+        if extract_archive(TGT_DL, TGT_ROM, "Target") != 0:
+            return _abort_port(auto, "Step 2 failed: target archive extraction")
+    else:
+        info("[2/2] TGT_URL empty, reusing existing target workspace")
+        log_write("Step 2: TGT_URL empty, reuse target workspace")
     info("Step 2 done")
     log_write("Step 2: Extract archives done")
 
@@ -980,11 +1194,13 @@ def one_click_port(auto=False):
     log_write("Step 3: Extract payload start")
     if not check_payload_extracted(SRC_UNPACK):
         info("[1/2] Extracting source payload...")
-        extract_payload_bin(SRC_ROM, SRC_UNPACK)
+        if extract_payload_bin(SRC_ROM, SRC_UNPACK) != 0:
+            return _abort_port(auto, "Step 3 failed: source payload extraction")
         log_write("Source payload extracted to: {}".format(SRC_UNPACK))
     if not check_payload_extracted(TGT_UNPACK):
         info("[2/2] Extracting target payload...")
-        extract_payload_bin(TGT_ROM, TGT_UNPACK)
+        if extract_payload_bin(TGT_ROM, TGT_UNPACK) != 0:
+            return _abort_port(auto, "Step 3 failed: target payload extraction")
         log_write("Target payload extracted to: {}".format(TGT_UNPACK))
     info("Step 3 done")
     log_write("Step 3: Extract payload done")
@@ -993,10 +1209,12 @@ def one_click_port(auto=False):
     info("=== Step 4/7: Unpack IMG ===")
     log_write("Step 4: Unpack IMG start")
     info("Unpacking source images...")
-    unpack_all_img(SRC_UNPACK, SRC_FS, "Source")
+    if unpack_all_img(SRC_UNPACK, SRC_FS, "Source") != 0:
+        return _abort_port(auto, "Step 4 failed: source image unpack")
     log_write("Source images unpacked to: {}".format(SRC_FS))
     info("Unpacking target images...")
-    unpack_all_img(TGT_UNPACK, TGT_FS, "Target")
+    if unpack_all_img(TGT_UNPACK, TGT_FS, "Target") != 0:
+        return _abort_port(auto, "Step 4 failed: target image unpack")
     log_write("Target images unpacked to: {}".format(TGT_FS))
     info("Step 4 done")
     log_write("Step 4: Unpack IMG done")
@@ -1007,15 +1225,13 @@ def one_click_port(auto=False):
     migrate_ok = 0
     migrate_fail = 0
     mh = TOOLS / "make_hyper.py"
-    rc = subprocess.run([PY, str(mh), "speed"]).returncode if mh.exists() else 1
+    rc = run_tool([PY, str(mh), "speed"]).returncode if mh.exists() else 1
     if rc == 0:
         migrate_ok += 1
         log_write("make_hyper.py speed: SUCCESS")
     else:
         migrate_fail += 1
-        err("Step 5 failed: make_hyper.py speed returned an error")
-        log_write("ERROR: make_hyper.py speed failed")
-        pause()
+        return _abort_port(auto, "Step 5 failed: make_hyper.py speed returned an error (rc={})".format(rc))
     info("Step 5 done. Success: {} , Fail: {}".format(migrate_ok, migrate_fail))
     log_write("Step 5: Migrate done (OK={}, Fail={})".format(migrate_ok, migrate_fail))
 
@@ -1059,6 +1275,7 @@ def one_click_port(auto=False):
     log_write("Partition image format check done (expected: {})".format(pack_cfg["format"]))
 
     counters = {"pack_ok": 0, "pack_fail": 0}
+    port_failed = False
     lpc_args = []
 
     # 打包源分区 system / system_ext / product
@@ -1083,6 +1300,8 @@ def one_click_port(auto=False):
     else:
         err("odm not found in target filesystem")
         log_write("ERROR: odm not found in target filesystem")
+        counters["pack_fail"] += 1
+        port_failed = True
         pause()
 
     # 复制 mi_ext（源 payload）
@@ -1100,7 +1319,7 @@ def one_click_port(auto=False):
             img = TGT_UNPACK / "vendor.img"
             if img.exists():
                 os.makedirs(TGT_FS / "vendor", exist_ok=True)
-                subprocess.run([PY, str(TOOLS / "extract_img.py"), str(img), str(TGT_FS / "vendor")])
+                run_tool([PY, str(TOOLS / "extract_img.py"), str(img), str(TGT_FS / "vendor")])
         log_write("Packing vendor from target filesystem (MTK)")
         info("Packing partition: vendor (MTK)")
         if (TGT_FS / "vendor").exists():
@@ -1108,6 +1327,8 @@ def one_click_port(auto=False):
         else:
             err("vendor not found in target filesystem")
             log_write("ERROR: vendor not found in target filesystem")
+            counters["pack_fail"] += 1
+            port_failed = True
             pause()
     else:
         log_write("Copying vendor from target payload")
@@ -1118,39 +1339,60 @@ def one_click_port(auto=False):
     if (TGT_UNPACK / "vendor_dlkm.img").exists():
         copy_partition_image("vendor_dlkm", TGT_UNPACK / "vendor_dlkm.img", pack_cfg, lpc_args, counters)
 
-    # 生成 super.img（可选），空间不足时自动触发极限精简
+    # 生成 super.img；空间不足(rc=1)时自动极限精简 → 重打包 product → 重试一次
     log_write("Creating super.img (pack_super={})".format(pack_cfg.get("pack_super", "false")))
     super_rc = create_super_img(pack_cfg, lpc_args, counters["pack_ok"])
     if super_rc == 1:
         info("Triggering extreme slimming mode (make_hyper.py extreme)...")
         log_write("Super space insufficient, running extreme slimming")
-        subprocess.run([PY, str(TOOLS / "make_hyper.py"), "extreme"])
-        info("Re-packing product partition after extreme slimming...")
-        lpc_args[:] = [a for a in lpc_args
-                        if not a.startswith("--partition=product:")
-                        and not a.startswith("--image=product=")]
-        try:
-            (PACK_OUT / "product.img").unlink()
-        except Exception:
-            pass
-        pack_one_partition("product", SRC_FS, pack_cfg, lpc_args, counters)
-        info("Retrying super.img creation...")
-        log_write("Retrying super.img after extreme slimming")
-        create_super_img(pack_cfg, lpc_args, counters["pack_ok"])
+        if run_tool([PY, str(TOOLS / "make_hyper.py"), "extreme"]).returncode != 0:
+            port_failed = True
+            err("make_hyper.py extreme failed, super.img not retried")
+            log_write("ERROR: make_hyper.py extreme failed")
+        else:
+            info("Re-packing product partition after extreme slimming...")
+            lpc_args[:] = [a for a in lpc_args
+                           if not a.startswith("--partition=product:")
+                           and not a.startswith("--image=product=")]
+            try:
+                (PACK_OUT / "product.img").unlink()
+            except Exception:
+                pass
+            pack_one_partition("product", SRC_FS, pack_cfg, lpc_args, counters)
+            info("Retrying super.img creation...")
+            log_write("Retrying super.img after extreme slimming")
+            super_rc = create_super_img(pack_cfg, lpc_args, counters["pack_ok"])
+            if super_rc != 0:
+                port_failed = True
+                err("super.img retry failed (rc={})".format(super_rc))
+                log_write("ERROR: super.img retry failed (rc={})".format(super_rc))
+    elif super_rc != 0:
+        port_failed = True
+        err("super.img creation failed (rc={})".format(super_rc))
+        log_write("ERROR: super.img creation failed (rc={})".format(super_rc))
 
     # vbmeta 禁验（在 super 打包之后、汇总之前，不受 pack_super 限制）
     patch_vbmeta(pack_cfg)
 
     # ---------------- Step 7: 汇总 ----------------
-    log_write("========== Porting Complete ==========")
+    port_ok = (not port_failed) and counters["pack_fail"] == 0
+    log_write("========== Porting {} ==========".format(
+        "Complete" if port_ok else "Finished With Errors"))
     log_write("Total packed: {} partitions, {} failed".format(counters["pack_ok"], counters["pack_fail"]))
     log_write("Step 6: Pack partitions done")
     log_write("Pack OK={}, Fail={}".format(counters["pack_ok"], counters["pack_fail"]))
     print()
     print("  {}{}============================================================{}".format(C, BD, N))
-    print("  {}{}Porting Complete!{}".format(G, BD, N))
+    if port_ok:
+        print("  {}{}Porting Complete!{}".format(G, BD, N))
+    else:
+        print("  {}{}Porting Finished With Errors!{}".format(R, BD, N))
     print("  {}{}============================================================{}".format(C, BD, N))
     print()
+    if not port_ok:
+        print("  {}  Pack OK={}, Fail={} -- check workspace log for details{}".format(
+            Y, counters["pack_ok"], counters["pack_fail"], N))
+        print()
     print("  {}  Source FS:    {}{}{}".format(W, C, SRC_FS, N))
     print("  {}  Target FS:    {}{}{}".format(W, C, TGT_FS, N))
     print("  {}  Output:       {}{}{}".format(W, C, str(PACK_OUT / "super.img"), N))
@@ -1210,7 +1452,7 @@ def one_click_port(auto=False):
     print()
     if not auto:
         pause()
-    return 0
+    return 0 if port_ok else 1
 
 
 # ---------------- 全局崩溃报告 ----------------
@@ -1251,6 +1493,81 @@ def crash_report(exc_type, exc, tb):
 sys.excepthook = crash_report
 
 
+# ---------------- [A] 命令执行器 ----------------
+def compose_super():
+    # 用 workspace/packed 现有分区镜像合成 super.img：
+    # 检测 packed 分区 → 从 config.ini 读取 super 参数 → lpmake 合成。
+    os.system("cls" if os.name == "nt" else "clear")
+    print()
+    print("  {}{}============================================================{}".format(C, BD, N))
+    print("  {}{}  Compose super.img{}".format(C, BD, N))
+    print("  {}{}============================================================{}".format(C, BD, N))
+    print()
+    pack_cfg = read_packing_config()
+    lpc_args = []
+    counters = {"pack_ok": 0, "pack_fail": 0}
+    found = []
+    for part in ALL_OUTPUT_PARTS:
+        img = PACK_OUT / (part + ".img")
+        if img.exists():
+            _append_lpc_entry(lpc_args, part, img, img.stat().st_size, pack_cfg)
+            counters["pack_ok"] += 1
+            found.append("{}  {} bytes".format(part + ".img", img.stat().st_size))
+    if not found:
+        err("No packed partition images found in workspace\\packed")
+        err("Run a port first (menu [1]), then compose super.img here")
+        log_write("compose_super aborted: no partition images in packed")
+        pause()
+        return
+    print("  {}  Partitions found in packed:{}{}".format(W, G, N))
+    for line in found:
+        print("  {}    - {}{}".format(W, line, N))
+    print("  {}  super: device_size={}  metadata={}/{} slots  group={}  virtual_ab={}  sparse={}".format(
+        W, pack_cfg.get("device_size", "?"), pack_cfg.get("metadata_size", "?"),
+        pack_cfg.get("metadata_slots", "?"), pack_cfg.get("super_group", "?"),
+        pack_cfg.get("virtual_ab", "?"), pack_cfg.get("sparse", "?"), N))
+    print()
+    try:
+        (PACK_OUT / "super.img").unlink()
+    except Exception:
+        pass
+    # create_super_img 内部按 pack_super 配置决定是否跳过，此处强制执行合成
+    pack_cfg["pack_super"] = "true"
+    rc = create_super_img(pack_cfg, lpc_args, counters["pack_ok"])
+    sup = PACK_OUT / "super.img"
+    if rc == 0 and sup.exists():
+        print()
+        print("  {}  super.img ready: {} bytes{}".format(G, sup.stat().st_size, N))
+        log_write("compose_super OK: {} bytes".format(sup.stat().st_size))
+    elif rc == 1:
+        # 单独合成时不自动触发极限精简重试，只提醒用户
+        print()
+        err("super space insufficient, compose aborted")
+        print("  {}  Tip: run extreme slimming (python tools/make_hyper.py extreme),{}"
+              .format(Y, N))
+        print("  {}  then re-pack and re-run this compose, or enlarge device_size in config.ini{}".format(Y, N))
+        log_write("compose_super: super space insufficient (rc=1), no auto retry")
+    elif rc != 0:
+        log_write("compose_super failed: rc={}".format(rc))
+    pause()
+
+
+def show_executor():
+    os.system("cls" if os.name == "nt" else "clear")
+    print()
+    print("  {}{}============================================================{}".format(C, BD, N))
+    print("  {}{}  Command Executor{}".format(C, BD, N))
+    print("  {}{}============================================================{}".format(C, BD, N))
+    print()
+    print("  {}  [1] Compose super.img{}".format(W, N))
+    print("  {}      Pack existing partitions in workspace\\packed into super.img{}".format(D, N))
+    print("  {}  [0] Back{}".format(W, N))
+    print()
+    ch = prompt("  {}Select [0-1]: {}".format(Y, N)).strip()
+    if ch == "1":
+        compose_super()
+
+
 # ---------------- 主菜单 ----------------
 def print_banner():
     print()
@@ -1270,12 +1587,13 @@ def show_menu():
     print("  {}{}  [1] One-Click Port HyperOS{}     {}Full auto workflow{}".format(G, BD, N, D, N))
     print()
     print("  {}{}  -- Tools --{}".format(Y, BD, N))
+    print("  {}  [A] Command Executor{}".format(W, N))
     print("  {}  [C] Open-Source Credits{}".format(W, N))
     print("  {}  [D] Clean workspace{}".format(W, N))
     print()
     print("  {}{}============================================================{}".format(C, BD, N))
     print()
-    choice = prompt("  {}{}Select [1, C-D]: {}".format(Y, BD, N))
+    choice = prompt("  {}{}Select [1, A-D]: {}".format(Y, BD, N))
     return choice.strip().lower()
 
 
@@ -1340,6 +1658,8 @@ def main():
             except KeyboardInterrupt:
                 print()
                 continue
+        elif ch == "a":
+            show_executor()
         elif ch == "c":
             show_credits()
         elif ch == "d":
