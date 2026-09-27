@@ -1,5 +1,7 @@
 # XMAPort
 
+简体中文 | [English](README_EN.md)
+
 [![GitHub Release](https://img.shields.io/badge/version-260919.Beta-blue)](../../releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)](#%E7%B3%BB%E7%BB%9F%E8%A6%81%E6%B1%82)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](#%E8%AE%B8%E5%8F%AF%E8%AF%81)
@@ -7,6 +9,20 @@
 **XMAPort** 是一款小米 HyperOS 自动化移植（Porting）工具：输入源机型 ROM 与目标底包 ROM 的官方完整包直链，即可自动完成下载、解包、分区迁移、打补丁与重打包，输出可直接刷写的目标机型镜像。
 
 ---
+
+## 目录
+
+- [简介](#简介)
+- [特性](#特性)
+- [工作流程](#工作流程)
+- [系统要求](#系统要求)
+- [使用方法](#使用方法)
+- [配置说明](#配置说明)
+- [注意事项与常见问题](#注意事项与常见问题)
+- [已测试的移植路线](#已测试的移植路线)
+- [免责声明](#免责声明)
+- [许可证](#许可证)
+- [致谢](#致谢)
 
 ## 简介
 
@@ -17,16 +33,18 @@ XMAPort 面向小米 HyperOS 设备的移植玩法：把一台机型的 HyperOS 
 ## 特性
 
 - **全自动 7 步流水线**：下载 → 解压卡刷包 → 解包 payload → 解包分区镜像 → 迁移打补丁 → 重打包 → 汇总输出，一条命令跑通
-- **多线程下载**：使用 aria2c 多线程下载官方 ROM 完整包直链
+- **双包并行下载**：源 ROM 与底包并行下载，双行实时进度条（每秒刷新、显示瞬时速度），失败自动整体重试
+- **失败即中断**：下载、解包、迁移、打包任一环节失败立即中止，汇总按真实结果显示成败
 - **完整分区迁移**：迁移 system / system_ext / product / mi_ext 到目标底包，自动处理 odm / vendor / vbmeta 等
 - **智能特性同步**：特性同步、清理 MIUI booster、同步 APEX、刷新率 / 相机 / 人脸解锁同步、build.prop 补丁
 - **联发科支持**：针对天玑 8100 / 8200 的 HWC 补丁
 - **灵活打包**：erofs（lz4hc / lz4 / zstd 等压缩算法）或 ext4，可选生成 super.img、sparse 格式、禁用 vbmeta 校验、注入 adb debug
+- **命令执行器**：主菜单 [A] 支持用已打包的分区单独合成 super.img
 - **云端构建**：自带 GitHub Actions workflow，无需本地环境即可构建并自动发布 Release
 
 ## 工作流程
 
-1. **下载 ROM**：使用 aria2c 多线程下载源机型与目标机型的官方 ROM 完整包直链
+1. **下载 ROM**：源包与底包并行，aria2c 多线程下载官方 ROM 完整包直链
 2. **解压卡刷包**：使用 7-Zip 解压 ROM zip
 3. **解包 payload**：使用 payload-dumper-go 解包 `payload.bin` / `.dat`
 4. **解包分区镜像**：使用 simg2img / lpunpack / extract.erofs 等工具解包 system、vendor、odm 等分区镜像
@@ -51,6 +69,8 @@ XMAPort 面向小米 HyperOS 设备的移植玩法：把一台机型的 HyperOS 
 python XMAPort.py
 ```
 
+主菜单除一键移植外，还提供 **[A] 命令执行器**（1 = 用 `workspace/packed` 里已有的分区镜像单独合成 super.img，空间不足时仅提示不自动重试）、**[C] 开源致谢** 与 **[D] 清理 workspace**。
+
 ### 方式二：命令行一键模式
 
 ```bat
@@ -63,9 +83,9 @@ python XMAPort.py --auto --device <目标代号> --source <源ROM直链> --targe
 python XMAPort.py --auto --device sky --source https://.../source-rom-full.zip --target https://.../target-rom-full.zip
 ```
 
-- `--device`：目标设备代号（如 `sky`、`vermeer` 等）
-- `--source`：源机型 ROM 完整包直链（不能以 `ultimateota` 开头）
-- `--target`：目标底包 ROM 完整包直链（不能以 `ultimateota` 开头）
+- `--device`：目标设备代号（仅允许字母、数字、下划线、连字符）
+- `--source`：源机型 ROM 完整包直链（不能以 `ultimateota` 开头；**留空可复用上次工作区数据**）
+- `--target`：目标底包 ROM 完整包直链（不能以 `ultimateota` 开头；留空同上）
 
 > 注意：使用前请先按 [配置说明](#配置说明) 检查 `config.ini`，特别是 `device_platform` 与 `device_size`。
 
@@ -84,7 +104,7 @@ python XMAPort.py --auto --device sky --source https://.../source-rom-full.zip -
 
 ## 配置说明
 
-所有配置集中在 `config.ini`：
+所有配置集中在 `config.ini`（GBK/ANSI 编码）：
 
 ### 基本设置（必须核对）
 
@@ -95,29 +115,28 @@ python XMAPort.py --auto --device sky --source https://.../source-rom-full.zip -
 
 ### 下载设置
 
-`[source]` / `[target]` 填写源 / 底包 ROM 直链；`[settings]` 控制 aria2c 的下载线程数（`threads`）、最大连接数（`max-connection`）、超时（`timeout`）与重试次数（`retry`）。
+`[source]` / `[target]` 填写源 / 底包 ROM 直链，**留空 = 不下载，复用上次工作区**；`[settings]` 控制 aria2c 的下载线程数（`threads`）、最大连接数（`max-connection`，官方 aria2 上限 16）、超时（`timeout`）与整体重试次数（`retry`，`0` = 只下载一次不重试）。
 
 ### 打包设置（`[packing]`）
 
 | 配置项 | 说明 |
 | --- | --- |
 | `format` | `erofs` 或 `ext4` |
-| `compression` | erofs 压缩算法（如 `lz4hc`、`lz4`、`zstd`） |
-| `compression_level` | erofs 压缩等级 |
-| `pack_super` | 是否打包生成 super.img |
+| `compression` / `compression_level` | erofs 压缩算法与等级（如 `lz4hc` + `8`） |
+| `pack_super` | 是否打包生成 super.img；`false` 时可用主菜单 [A] 单独合成 |
 | `sparse` | 是否生成 sparse 格式镜像 |
-| `readonly` | 分区是否设为只读 |
 | `metadata_size` / `metadata_slots` | super metadata 大小与插槽数（建议默认 `65536` / `3`） |
 | `virtual_ab` | 是否启用 Virtual A/B |
-| `enable_adb_debug` | 是否注入 adb debug |
+| `super_name` / `super_group` | super 分区名与动态分区组名（高通一般 `qti_dynamic_partitions`，MTK 一般 `main`） |
+| `enable_adb_debug` | 是否注入 adb debug（调试用，日常包建议关闭） |
 | `patch_vbmeta` | 是否禁用 vbmeta 校验 |
-| `is_skip_apex` | 跳过 system_ext 重打包并直接复制源镜像（建议默认） |
-
-其余参数（`utc_stamp`、`super_name`、`super_group`、`erofs_old_kernel`、`ext4_packer` 等）建议保持默认。
+| `is_skip_apex` | 跳过 system_ext 重打包并直接复制源镜像 |
+| `erofs_old_kernel` | 旧内核兼容布局（仅老内核设备开启） |
+| `utc_stamp` | 镜像时间戳，留空自动用 UTC |
 
 ### build.prop 补丁列表
 
-文件末尾的 prop 列表会在迁移时写入 build.prop，例如电池快充（`persist.vendor.accelerate.charge`）、夜间充电（`persist.vendor.night.charge`）、默认刷新率（`ro.vendor.display.default_fps`）等。可以自行添加 prop，但**自行添加不保证开机**。
+文件末尾 `; patch build prop list` 标记行以下的 prop 列表会在迁移时写入 build.prop，例如电池快充（`persist.vendor.accelerate.charge`）、夜间充电（`persist.vendor.night.charge`）、默认刷新率（`ro.vendor.display.default_fps`）等。可以自行添加 prop，但**自行添加不保证开机**。
 
 ## 注意事项与常见问题
 
@@ -156,181 +175,8 @@ python XMAPort.py --auto --device sky --source https://.../source-rom-full.zip -
 - 本项目使用 AI 辅助编码（Vibe Coding，DeepSeek / GLM / 小米 MiMo 等）
 - 感谢以下开源项目的支持：
   - [aria2](https://github.com/aria2/aria2)、[7-Zip](https://www.7-zip.org/)
-  - [payload-dumper-go](https://github.com/xunchangguo/payload-dumper-go)
-  - [erofs-utils](https://github.com/erofs/erofs-utils)、[lpunpack / lpmake](https://android.googlesource.com/platform/system/extras/)、e2fsprogs 相关工具
+  - [payload-dumper-go](https://github.com/ssut/payload-dumper-go)
+  - [erofs-utils](https://github.com/erofs/erofs-utils)、[lpunpack / lpmake](https://android.googlesource.com/platform/system/extras/)、[e2fsprogs](https://github.com/tytso/e2fsprogs)
+  - [Google Brotli](https://github.com/google/brotli)
+  - [Magisk](https://github.com/topjohnwu/Magisk)（vbmeta 禁验参照其已验证做法）
   - 以及所有 HyperOS 移植社区的开发者们
-
----
----
-
-# XMAPort (English)
-
-**XMAPort** is an automated porting tool for Xiaomi HyperOS: feed it the official full-ROM direct links of a source device and a target base ROM, and it automatically handles downloading, unpacking, partition migration, patching and repacking — producing flashable images for the target device.
-
----
-
-## Table of Contents
-
-- [Introduction](#introduction-1)
-- [Features](#features-1)
-- [Workflow](#workflow-1)
-- [Requirements](#requirements-1)
-- [Usage](#usage-1)
-- [Configuration](#configuration-1)
-- [Notes & FAQ](#notes--faq-1)
-- [Tested Ports](#tested-ports-1)
-- [Disclaimer](#disclaimer-1)
-- [License](#license-1)
-- [Acknowledgements](#acknowledgements-1)
-
-## Introduction
-
-XMAPort is built for the HyperOS porting scene on Xiaomi devices: it migrates one device's HyperOS system partitions (system / system_ext / product / mi_ext, etc.) onto another device's official base ROM, and automatically performs feature syncing, property patching and image repacking.
-
-The whole pipeline is driven by the main script `XMAPort.py` (Python 3.8+, Windows platform). The core migration logic lives in `tools/make_hyper.py` and the packing logic in `tools/pack_partitions.py`. You can run it via an interactive Windows menu, a one-shot CLI mode, or entirely in the cloud using the bundled GitHub Actions workflow.
-
-## Features
-
-- **Fully automated 7-step pipeline**: download → extract recovery ROM → unpack payload → unpack partition images → migrate & patch → repack → collect output, all in one command
-- **Multi-threaded downloading**: aria2c multi-threaded download of official full-ROM direct links
-- **Full partition migration**: migrates system / system_ext / product / mi_ext onto the target base ROM, with automatic handling of odm / vendor / vbmeta
-- **Smart feature syncing**: feature sync, MIUI booster cleanup, APEX sync, refresh-rate / camera / face-unlock sync, build.prop patching
-- **MediaTek support**: HWC patches for Dimensity 8100 / 8200
-- **Flexible packing**: erofs (with lz4hc / lz4 / zstd compression) or ext4; optional super.img, sparse images, vbmeta verification disabling, and adb debug injection
-- **Cloud builds**: bundled GitHub Actions workflow lets you build and publish Releases without a local environment
-
-## Workflow
-
-1. **Download ROMs**: aria2c multi-threaded download of the official full ROMs for the source and target devices
-2. **Extract recovery ROM**: unzip the ROM zip with 7-Zip
-3. **Unpack payload**: unpack `payload.bin` / `.dat` with payload-dumper-go
-4. **Unpack partition images**: unpack system, vendor, odm and other partition images with simg2img / lpunpack / extract.erofs, etc.
-5. **Migrate & patch**: the core logic in `tools/make_hyper.py` migrates the source's system / system_ext / product / mi_ext onto the target base ROM — including feature sync, MIUI booster cleanup, APEX sync, refresh-rate / camera / face-unlock sync, build.prop patches, and HWC patches for MediaTek Dimensity 8100 / 8200
-6. **Repack**: `tools/pack_partitions.py` packs partitions as erofs (supporting lz4hc / lz4 / zstd and other compression algorithms) or ext4, with optional super.img generation, sparse images, vbmeta verification disabling and adb debug injection
-7. **Collect output**: assembles the final flashable images for the target device
-
-## Requirements
-
-- Windows 10 / 11 64-bit
-- Python 3.8+
-- About 40GB of free disk space
-- Network access to GitHub and Xiaomi CDN
-
-## Usage
-
-### Option 1: Interactive menu (Windows)
-
-Run the main script and follow the menu:
-
-```bat
-python XMAPort.py
-```
-
-### Option 2: One-shot CLI mode
-
-```bat
-python XMAPort.py --auto --device <target-codename> --source <source-rom-url> --target <base-rom-url>
-```
-
-Example:
-
-```bat
-python XMAPort.py --auto --device sky --source https://.../source-rom-full.zip --target https://.../target-rom-full.zip
-```
-
-- `--device`: target device codename (e.g. `sky`, `vermeer`)
-- `--source`: direct URL of the source device's full ROM (must not start with `ultimateota`)
-- `--target`: direct URL of the target base ROM (must not start with `ultimateota`)
-
-> Note: before running, check `config.ini` as described in [Configuration](#configuration-1) — especially `device_platform` and `device_size`.
-
-### Option 3: GitHub Actions cloud build
-
-The repository ships with `.github/workflows/build.yml` — no local environment needed:
-
-1. Open the repo's **Actions** page and select the **build** workflow
-2. Click **Run workflow** (`workflow_dispatch`), and fill in:
-   - `device`: target device codename
-   - `source`: direct URL of the source full ROM
-   - `target`: direct URL of the base full ROM
-3. When the build finishes, `super.img` is automatically split into volumes and published to a Release
-
-In addition, every push automatically packs the source code and publishes an `XMAPort-*-Beta` release.
-
-## Configuration
-
-All settings live in `config.ini`:
-
-### Essential settings (must verify)
-
-| Key | Description |
-| --- | --- |
-| `device_platform` | Device platform: `Qualcomm` / `MTK`. **Must be filled in truthfully — a wrong value risks a hard brick.** |
-| `device_size` | Total size of the target device's super partition in bytes; default `6979321856` (6.5GB). **Must match your actual device.** |
-
-### Download settings
-
-Put the source / base ROM direct links under `[source]` / `[target]`; `[settings]` controls aria2c's `threads`, `max-connection`, `timeout` and `retry`.
-
-### Packing settings (`[packing]`)
-
-| Key | Description |
-| --- | --- |
-| `format` | `erofs` or `ext4` |
-| `compression` | erofs compression algorithm (e.g. `lz4hc`, `lz4`, `zstd`) |
-| `compression_level` | erofs compression level |
-| `pack_super` | Whether to pack a super.img |
-| `sparse` | Whether to output sparse-format images |
-| `readonly` | Whether partitions are marked read-only |
-| `metadata_size` / `metadata_slots` | super metadata size and slot count (defaults `65536` / `3` recommended) |
-| `virtual_ab` | Whether Virtual A/B is enabled |
-| `enable_adb_debug` | Whether to inject adb debug |
-| `patch_vbmeta` | Whether to disable vbmeta verification |
-| `is_skip_apex` | Skip system_ext repacking and copy the source image directly (keep default) |
-
-Other keys (`utc_stamp`, `super_name`, `super_group`, `erofs_old_kernel`, `ext4_packer`, etc.) are best left at their defaults.
-
-### build.prop patch list
-
-The prop list at the end of the file is written into build.prop during migration — e.g. fast charging (`persist.vendor.accelerate.charge`), night charging (`persist.vendor.night.charge`), default refresh rate (`ro.vendor.display.default_fps`), and so on. You may add your own props, but **custom props are not guaranteed to boot**.
-
-## Notes & FAQ
-
-- **ROM direct links**: `--source` / `--target` must be direct download URLs of official full recovery ROMs (fastboot packages are not supported), and must not start with `ultimateota`
-- **Wrong platform can brick your device**: double-check whether the target is Qualcomm or MediaTek before setting `device_platform`
-- **super size must be accurate**: a `device_size` that doesn't match the device may make the image unflashable or unbootable
-- **Disk space**: downloads, unpacking and repacking produce many intermediate files — reserve about 40GB
-- **Antivirus false positives**: the bundled third-party executables (aria2c, 7z, mkfs.erofs, etc.) may be flagged; add trust exclusions or temporarily disable your antivirus
-- **Theoretical support**: Xiaomi 11–15, REDMI K50–K90, Note / REDMI 12–15 series (see the table below for what has actually been tested)
-- **Finding the device codename**: the codename is the device identifier in the base ROM's version string (e.g. `sky` in `OS2.0.204.0.VMWCNXM`)
-
-## Tested Ports
-
-| Source device | Target device |
-| --- | --- |
-| REDMI Note12R | K70 / Note12Turbo / Note17 / Xiaomi 12 / Xiaomi 17 Ultra |
-| Note12T Pro | K90 Max |
-| K100 Pro | Xiaomi 17 Ultra |
-
-These are the verified routes. Other devices with matching architectures may work in theory but are unverified — test at your own risk.
-
-## Disclaimer
-
-- This project is **for personal learning and testing only**; please delete the related files within 24 hours of downloading
-- Flashing carries risks of **bricking** and **data loss**. You assume full responsibility for any consequences of using this project
-- This project is **not affiliated with Xiaomi**; the ROMs are copyrighted by Xiaomi Inc.
-- **Commercial use is prohibited**
-
-## License
-
-- The project's main code (`XMAPort.py`, `tools/*.py`) is licensed under [MIT](LICENSE)
-- The bundled third-party tools are governed by their original licenses respectively: AGPL-3.0 / GPL-2.0 / LGPL-2.1, with the corresponding LICENSE files included in the repository
-
-## Acknowledgements
-
-- This project is built with AI-assisted coding (Vibe Coding, using DeepSeek / GLM / Xiaomi MiMo, etc.)
-- Thanks to the following open-source projects:
-  - [aria2](https://github.com/aria2/aria2), [7-Zip](https://www.7-zip.org/)
-  - [payload-dumper-go](https://github.com/xunchangguo/payload-dumper-go)
-  - [erofs-utils](https://github.com/erofs/erofs-utils), [lpunpack / lpmake](https://android.googlesource.com/platform/system/extras/), e2fsprogs tools
-  - And all developers in the HyperOS porting community
