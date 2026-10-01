@@ -39,6 +39,16 @@ XMAPort 面向小米 HyperOS 设备的移植玩法：把一台机型的 HyperOS 
 6. **重打包**：`tools/pack_partitions.py` 按 erofs（支持 lz4hc / lz4 / zstd 等压缩）或 ext4 打包，可选生成 super.img、生成 sparse 格式、禁用 vbmeta 校验、注入 adb debug
 7. **汇总输出**：汇总输出可刷写的目标机型镜像
 
+## 已测试的移植路线
+
+| 源机型 | 目标机型 |
+| --- | --- |
+| REDMI Note12R | K70 / Note12Turbo / Note17 / 小米12 / 小米17 Ultra |
+| Note12T Pro | K90 Max |
+| K100 Pro | 小米17 Ultra |
+
+以上为已实测路线；其他同架构机型理论上也可行，但未经验证，请自行测试并承担风险。
+
 ## 系统要求
 
 - Windows 10 / 11 64 位
@@ -135,15 +145,7 @@ python XMAPort.py --auto --device sky --source https://.../source-rom-full.zip -
 - **理论支持范围**：小米 11–15、REDMI K50–K90、Note / REDMI 12–15 系列（详见下表实际测试情况）
 - **命令行模式找不到设备代号**：目标设备代号即底包 ROM 中 MIUI/HyperOS 版本号后的设备代号（如 `OS2.0.204.0.VMWCNXM` 中的 `sky`）
 
-## 已测试的移植路线
 
-| 源机型 | 目标机型 |
-| --- | --- |
-| REDMI Note12R | K70 / Note12Turbo / Note17 / 小米12 / 小米17 Ultra |
-| Note12T Pro | K90 Max |
-| K100 Pro | 小米17 Ultra |
-
-以上为已实测路线；其他同架构机型理论上也可行，但未经验证，请自行测试并承担风险。
 
 ## 免责声明
 
