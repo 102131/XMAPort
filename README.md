@@ -44,7 +44,7 @@ XMAPort 面向小米 HyperOS 设备的移植玩法：把一台机型的 HyperOS 
 - Windows 10 / 11 64 位
 - Python 3.8+
 - 约 40GB 可用磁盘空间
-- 可访问 GitHub 与小米 CDN 的网络环境
+- 可访问 GitHub 的网络环境
 
 ## 使用方法
 
