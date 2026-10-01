@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | English
 
-[![GitHub Release](https://img.shields.io/badge/version-260919.Beta-blue)](../../releases)
+[![GitHub Release](https://img.shields.io/badge/version-261001.Beta-blue)](../../releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)](#requirements)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](#license)
 
