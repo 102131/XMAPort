@@ -10,20 +10,6 @@
 
 ---
 
-## Table of Contents
-
-- [Introduction](#introduction)
-- [Features](#features)
-- [Workflow](#workflow)
-- [Requirements](#requirements)
-- [Usage](#usage)
-- [Configuration](#configuration)
-- [Notes & FAQ](#notes--faq)
-- [Tested Ports](#tested-ports)
-- [Disclaimer](#disclaimer)
-- [License](#license)
-- [Acknowledgements](#acknowledgements)
-
 ## Introduction
 
 XMAPort is built for the HyperOS porting scene on Xiaomi devices: it migrates one device's HyperOS system partitions (system / system_ext / product / mi_ext, etc.) onto another device's official base ROM, and automatically performs feature syncing, property patching and image repacking.
